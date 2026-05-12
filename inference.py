@@ -50,6 +50,9 @@ parser.add_argument('--rotate', default=False, action='store_true',
 parser.add_argument('--nosmooth', default=False, action='store_true',
 					help='Prevent smoothing face detections over a short temporal window')
 
+parser.add_argument('--gfpgan', default=False, action='store_true',
+					help='Use GFPGAN to enhance and de-blur the face. Requires gfpgan package.')
+
 args = parser.parse_args()
 args.img_size = 96
 
@@ -88,7 +91,8 @@ def face_detect(images):
 	pady1, pady2, padx1, padx2 = args.pads
 	for rect, image in zip(predictions, images):
 		if rect is None:
-			cv2.imwrite('temp/faulty_frame.jpg', image) # check this frame where the face was not detected.
+			os.makedirs('temp', exist_ok=True)
+			cv2.imwrite('temp/faulty_frame.jpg', image)
 			raise ValueError('Face not detected! Ensure the video contains a face in all the frames.')
 
 		y1 = max(0, rect[1] - pady1)
@@ -110,7 +114,7 @@ def datagen(frames, mels):
 
 	if args.box[0] == -1:
 		if not args.static:
-			face_det_results = face_detect(frames) # BGR2RGB for CNN face detection
+			face_det_results = face_detect(frames)
 		else:
 			face_det_results = face_detect([frames[0]])
 	else:
@@ -154,7 +158,7 @@ def datagen(frames, mels):
 		yield img_batch, mel_batch, frame_batch, coords_batch
 
 mel_step_size = 16
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = 'cuda' if torch.cuda.is_available() else ('mps' if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available() else 'cpu')
 print('Using {} for inference.'.format(device))
 
 def _load(checkpoint_path):
@@ -179,6 +183,9 @@ def load_model(path):
 	return model.eval()
 
 def main():
+	os.makedirs('temp', exist_ok=True)
+	os.makedirs(os.path.dirname(args.outfile) if os.path.dirname(args.outfile) else '.', exist_ok=True)
+
 	if not os.path.isfile(args.face):
 		raise ValueError('--face argument must be a valid path to video/image file')
 
@@ -202,7 +209,7 @@ def main():
 				frame = cv2.resize(frame, (frame.shape[1]//args.resize_factor, frame.shape[0]//args.resize_factor))
 
 			if args.rotate:
-				frame = cv2.rotate(frame, cv2.cv2.ROTATE_90_CLOCKWISE)
+				frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
 
 			y1, y2, x1, x2 = args.crop
 			if x2 == -1: x2 = frame.shape[1]
@@ -246,6 +253,8 @@ def main():
 	batch_size = args.wav2lip_batch_size
 	gen = datagen(full_frames.copy(), mel_chunks)
 
+	result_video_path = 'temp/result.mp4'
+
 	for i, (img_batch, mel_batch, frames, coords) in enumerate(tqdm(gen, 
 											total=int(np.ceil(float(len(mel_chunks))/batch_size)))):
 		if i == 0:
@@ -253,8 +262,17 @@ def main():
 			print ("Model loaded")
 
 			frame_h, frame_w = full_frames[0].shape[:-1]
-			out = cv2.VideoWriter('temp/result.avi', 
-									cv2.VideoWriter_fourcc(*'DIVX'), fps, (frame_w, frame_h))
+
+			fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+			out = cv2.VideoWriter(
+				result_video_path,
+				fourcc,
+				fps,
+				(frame_w, frame_h)
+			)
+
+			if not out.isOpened():
+				raise RuntimeError('OpenCV VideoWriter failed to open temp/result.mp4')
 
 		img_batch = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(device)
 		mel_batch = torch.FloatTensor(np.transpose(mel_batch, (0, 3, 1, 2))).to(device)
@@ -264,16 +282,43 @@ def main():
 
 		pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.
 		
+		# Initialize GFPGAN if needed
+		if args.gfpgan and not hasattr(args, 'restorer'):
+			try:
+				from gfpgan import GFPGANer
+				print("Loading GFPGAN model (will download on first run)...")
+				args.restorer = GFPGANer(
+					model_path='https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth',
+					upscale=1,
+					arch='clean',
+					channel_multiplier=2,
+					bg_upsampler=None)
+				print("GFPGAN loaded successfully.")
+			except ImportError:
+				print("WARNING: GFPGAN not installed. Please run: pip install gfpgan basicsr facexlib realesrgan")
+				args.gfpgan = False
+			except Exception as e:
+				print(f"WARNING: Failed to load GFPGAN: {e}")
+				args.gfpgan = False
+		
 		for p, f, c in zip(pred, frames, coords):
 			y1, y2, x1, x2 = c
 			p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
 
 			f[y1:y2, x1:x2] = p
+			
+			if getattr(args, 'gfpgan', False) and hasattr(args, 'restorer'):
+				# Enhance the frame using GFPGAN
+				_, _, f = args.restorer.enhance(f, has_aligned=False, only_center_face=False, paste_back=True)
+				
 			out.write(f)
 
 	out.release()
 
-	command = 'ffmpeg -y -i {} -i {} -strict -2 -q:v 1 {}'.format(args.audio, 'temp/result.avi', args.outfile)
+	if not os.path.exists(result_video_path):
+		raise FileNotFoundError('Wav2Lip temporary video was not created: temp/result.mp4')
+
+	command = 'ffmpeg -y -i {} -i {} -strict -2 -q:v 1 {}'.format(args.audio, result_video_path, args.outfile)
 	subprocess.call(command, shell=platform.system() != 'Windows')
 
 if __name__ == '__main__':
